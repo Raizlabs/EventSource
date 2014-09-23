@@ -33,6 +33,7 @@ static NSString *const ESEventRetryKey = @"retry";
 @property (nonatomic, assign) NSTimeInterval timeoutInterval;
 @property (nonatomic, assign) NSTimeInterval retryInterval;
 @property (nonatomic, strong) id lastEventID;
+@property (strong, nonatomic, readwrite) NSData *dataBuffer;
 
 - (void)open;
 
@@ -150,8 +151,19 @@ static NSString *const ESEventRetryKey = @"retry";
     });
 }
 
-- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data
+- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)newData
 {
+    NSData *data = newData;
+
+    if ( self.dataBuffer != nil ) {
+        // NSLog(@"%s: Using dataBuffer", __PRETTY_FUNCTION__);
+        NSMutableData *mutableData = [[NSMutableData alloc] initWithData:self.dataBuffer];
+        [mutableData appendData:newData];
+        data = [mutableData copy];
+
+        self.dataBuffer = nil;
+    }
+    
     __block NSString *eventString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     
     if ([eventString hasSuffix:ESEventSeparatorLFLF] ||
@@ -205,6 +217,10 @@ static NSString *const ESEventRetryKey = @"retry";
                 }
             }
         });
+    }
+    else {
+        // NSLog(@"%s: Creating dataBuffer", __PRETTY_FUNCTION__);
+        self.dataBuffer = [NSData dataWithData:newData];
     }
 }
 
