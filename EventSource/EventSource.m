@@ -208,7 +208,7 @@ static NSString *const ESEventRetryKey = @"retry";
                 });
             }
             
-            if (e.event != nil) {
+            if (e.event != nil && [e.event isEqualToString:MessageEvent] == NO) {
                 NSArray *namedEventhandlers = self.listeners[e.event];
                 for (EventSourceEventHandler handler in namedEventhandlers) {
                     dispatch_async(dispatch_get_main_queue(), ^{
