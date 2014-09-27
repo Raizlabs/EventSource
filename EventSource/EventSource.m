@@ -23,6 +23,8 @@ static NSString *const ESEventIDKey = @"id";
 static NSString *const ESEventEventKey = @"event";
 static NSString *const ESEventRetryKey = @"retry";
 
+static NSString *const ESEventDataRegularExpression = @"event: (.*)\ndata: (.*)\n\n";
+
 @interface EventSource () <NSURLConnectionDelegate, NSURLConnectionDataDelegate> {
     BOOL wasClosed;
 }
@@ -34,6 +36,8 @@ static NSString *const ESEventRetryKey = @"retry";
 @property (nonatomic, assign) NSTimeInterval retryInterval;
 @property (nonatomic, strong) id lastEventID;
 @property (strong, nonatomic, readwrite) NSData *dataBuffer;
+
+@property (assign, nonatomic, readwrite) dispatch_queue_t serialQueue;
 
 - (void)open;
 
@@ -69,6 +73,8 @@ static NSString *const ESEventRetryKey = @"retry";
         dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
             [self open];
         });
+
+        self.serialQueue = dispatch_queue_create("com.eventSource.queue", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
@@ -104,6 +110,7 @@ static NSString *const ESEventRetryKey = @"retry";
     if (self.lastEventID) {
         [request setValue:self.lastEventID forHTTPHeaderField:@"Last-Event-ID"];
     }
+
     self.eventSource = [[NSURLConnection alloc] initWithRequest:request delegate:self startImmediately:YES];
 }
 
@@ -151,77 +158,93 @@ static NSString *const ESEventRetryKey = @"retry";
     });
 }
 
-- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)newData
+- (void)sendEventForName:(NSString *)eventName data:(NSString *)eventData
 {
-    NSData *data = newData;
+    NSAssert([NSThread currentThread] == [NSThread mainThread], @"Must run on main thread!");
+    NSAssert([eventName length] > 0, @"Invalid event name");
 
-    if ( self.dataBuffer != nil ) {
-        // NSLog(@"%s: Using dataBuffer", __PRETTY_FUNCTION__);
-        NSMutableData *mutableData = [[NSMutableData alloc] initWithData:self.dataBuffer];
-        [mutableData appendData:newData];
-        data = [mutableData copy];
+    Event *e = [Event new];
+    e.readyState = kEventStateOpen;
+    e.event = eventName;
+    e.data = eventData;
 
-        self.dataBuffer = nil;
-    }
-    
-    __block NSString *eventString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    
-    if ([eventString hasSuffix:ESEventSeparatorLFLF] ||
-        [eventString hasSuffix:ESEventSeparatorCRCR] ||
-        [eventString hasSuffix:ESEventSeparatorCRLFCRLF]) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-            eventString = [eventString stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-            NSMutableArray *components = [[eventString componentsSeparatedByString:ESEventKeyValuePairSeparator] mutableCopy];
-            
-            Event *e = [Event new];
-            e.readyState = kEventStateOpen;
-            
-            for (NSString *component in components) {
-                if (component.length == 0) {
-                    continue;
-                }
-                
-                NSInteger index = [component rangeOfString:ESKeyValueDelimiter].location;
-                if (index == NSNotFound || index == (component.length - 2)) {
-                    continue;
-                }
-                
-                NSString *key = [component substringToIndex:index];
-                NSString *value = [component substringFromIndex:index + ESKeyValueDelimiter.length];
-                
-                if ([key isEqualToString:ESEventIDKey]) {
-                    e.id = value;
-                    self.lastEventID = e.id;
-                } else if ([key isEqualToString:ESEventEventKey]) {
-                    e.event = value;
-                } else if ([key isEqualToString:ESEventDataKey]) {
-                    e.data = value;
-                } else if ([key isEqualToString:ESEventRetryKey]) {
-                    self.retryInterval = [value doubleValue];
-                }
-            }
-            
-            NSArray *messageHandlers = self.listeners[MessageEvent];
-            for (EventSourceEventHandler handler in messageHandlers) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    handler(e);
-                });
-            }
-            
-            if (e.event != nil && [e.event isEqualToString:MessageEvent] == NO) {
-                NSArray *namedEventhandlers = self.listeners[e.event];
-                for (EventSourceEventHandler handler in namedEventhandlers) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        handler(e);
-                    });
-                }
-            }
+    NSArray *messageHandlers = self.listeners[MessageEvent];
+    for (EventSourceEventHandler handler in messageHandlers) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            handler(e);
         });
     }
-    else {
-        // NSLog(@"%s: Creating dataBuffer", __PRETTY_FUNCTION__);
-        self.dataBuffer = [NSData dataWithData:newData];
+
+    if (e.event != nil && [e.event isEqualToString:MessageEvent] == NO) {
+        NSArray *namedEventhandlers = self.listeners[e.event];
+        for (EventSourceEventHandler handler in namedEventhandlers) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                handler(e);
+            });
+        }
     }
+}
+
+- (void)processEventsFromDataBuffer
+{
+    if ( [self.dataBuffer length] > 0 ) {
+        NSString *stringBuffer = [[NSString alloc] initWithData:self.dataBuffer encoding:NSUTF8StringEncoding];
+        NSError *error = nil;
+        NSRegularExpression *expression = [NSRegularExpression regularExpressionWithPattern:ESEventDataRegularExpression options:0 error:&error];
+
+        while ( YES ) {
+            NSTextCheckingResult *match = [expression firstMatchInString:stringBuffer options:0 range:NSMakeRange(0, stringBuffer.length)];
+            if ( match == nil ) {
+                break;
+            }
+            else {
+                NSRange overallRange = match.range;
+                NSRange eventNameRange = [match rangeAtIndex:1];
+                NSRange dataRange = [match rangeAtIndex:2];
+
+                NSString *eventName = [stringBuffer substringWithRange:eventNameRange];
+                NSString *eventData = [stringBuffer substringWithRange:dataRange];
+
+//                NSLog(@"%s: Found NAME: %@", __PRETTY_FUNCTION__, eventName);
+//                NSLog(@"%s: Found DATA: %@", __PRETTY_FUNCTION__, eventData);
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self sendEventForName:eventName data:eventData];
+                });
+
+                if ( overallRange.length == stringBuffer.length ) {
+                    // We've matched the whole thing. Clear it.
+                    stringBuffer = nil;
+                    break;
+                }
+                else {
+                    // There is some length that is unmatched. This must be a part of another response, or a response that wasn't fully put into a chunk. Store it for later.
+                    NSMutableString *mutableStringBuffer = [stringBuffer mutableCopy];
+                    [mutableStringBuffer deleteCharactersInRange:overallRange];
+                    stringBuffer = [mutableStringBuffer copy];
+                }
+            }
+        }
+
+        self.dataBuffer = [stringBuffer dataUsingEncoding:NSUTF8StringEncoding];
+    }
+}
+
+- (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)newData
+{
+    dispatch_async(self.serialQueue, ^{
+        NSData *dataBuffer = self.dataBuffer;
+        if ( dataBuffer == nil ) {
+            self.dataBuffer = [newData copy];
+        }
+        else {
+            NSMutableData *dataBuffer = [NSMutableData dataWithData:self.dataBuffer];
+            [dataBuffer appendData:newData];
+            self.dataBuffer = [dataBuffer copy];
+        }
+
+        [self processEventsFromDataBuffer];
+    });
 }
 
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection
