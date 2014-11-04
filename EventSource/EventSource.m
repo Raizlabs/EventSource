@@ -111,7 +111,9 @@ static NSString *const ESEventDataRegularExpression = @"event: (.*)\ndata: (.*)\
         [request setValue:self.lastEventID forHTTPHeaderField:@"Last-Event-ID"];
     }
 
-    self.eventSource = [[NSURLConnection alloc] initWithRequest:request delegate:self startImmediately:YES];
+    self.eventSource = [[NSURLConnection alloc] initWithRequest:request delegate:self startImmediately:NO];
+    [self.eventSource scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+    [self.eventSource start];
 }
 
 - (void)close
